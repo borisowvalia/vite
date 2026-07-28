@@ -17,6 +17,7 @@ import {
   readManifest,
   serverLogs,
   viteTestUrl,
+  waitForBundledDevSettled,
   watcher,
 } from '~utils'
 
@@ -607,6 +608,12 @@ test('new URL(..., import.meta.url)', async () => {
 
   expect(await page.textContent('.import-meta-url')).toMatch(imgMatch)
   if (isServe) {
+    // bundled dev: the content edit changes the hashed URL, so wait for the
+    // page state produced by this exact build — the shape-only `imgMatch`
+    // polls below also match the pre-edit page, and a trailing reload would
+    // land in a later test (in plain dev the URL never changes, so the
+    // hash-based polls cannot apply there)
+    const before = await page.textContent('.import-meta-url')
     const loadPromise = page.waitForEvent('load')
     const newContent = readFile('import-meta-url/img-update.png', null)
     let oldContent: Buffer
@@ -615,6 +622,11 @@ test('new URL(..., import.meta.url)', async () => {
       return newContent
     })
     await loadPromise // expect reload
+    if (isBundledDev) {
+      await expect
+        .poll(() => page.textContent('.import-meta-url'))
+        .not.toBe(before)
+    }
     await expect
       .poll(() => page.textContent('.import-meta-url'))
       .toMatch(imgMatch)
@@ -622,9 +634,16 @@ test('new URL(..., import.meta.url)', async () => {
     const loadPromise2 = page.waitForEvent('load')
     editFile('import-meta-url/img.png', null, (_) => oldContent)
     await loadPromise2 // expect reload
+    if (isBundledDev) {
+      // restored content hashes back to the original URL
+      await expect.poll(() => page.textContent('.import-meta-url')).toBe(before)
+    }
     await expect
       .poll(() => page.textContent('.import-meta-url'))
       .toMatch(imgMatch)
+    // bundled dev sends two reloads per asset edit (measured ~50ms apart);
+    // settle so the trailing one cannot hit a later test
+    await waitForBundledDevSettled()
   }
 })
 

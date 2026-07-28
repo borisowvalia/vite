@@ -286,6 +286,59 @@ async function loadConfig(configEnv: ConfigEnv) {
   return merged
 }
 
+/**
+ * Waits until the current page has settled under bundled dev (no-op
+ * otherwise): no deferred full reload pending on the server, the page
+ * finished loading, and its client is registered — held across two
+ * consecutive checks 100ms apart, because bundled dev can send a second
+ * reload ~50ms after the first (measured), so a single positive check can
+ * race it. A page that never loads the client runtime (e.g. SSR-rendered
+ * pages) cannot register a client; a fully loaded page with no runtime
+ * counts as settled.
+ *
+ * Call this at the end of any test that forces page reloads, so a trailing
+ * navigation cannot destroy a later test's page context.
+ *
+ * TODO: workaround — an edit fired while no client is connected is dropped
+ * (vitejs/vite#23028). Remove the client-registered wait once the server
+ * buffers updates for clients that connect later.
+ */
+export async function waitForBundledDevSettled(): Promise<void> {
+  if (!isBundledDev) return
+  // `bundledDev` internals are private — the harness reaches in rather than
+  // widening the public API for tests only.
+  const bundledDev = (viteServer as any)?.environments?.client?.bundledDev
+  if (!bundledDev) return
+  let stableChecks = 0
+  let lastClientId: string | undefined
+  await vi.waitUntil(
+    async () => {
+      const state = await page
+        .evaluate(() => ({
+          loaded: document.readyState === 'complete',
+          hasRuntime: !!(globalThis as any).__rolldown_runtime__,
+          clientId: (globalThis as any).__rolldown_runtime__?.clientId,
+        }))
+        .catch(() => undefined)
+      const settled =
+        !!state &&
+        state.loaded &&
+        !bundledDev.fullReloadPending &&
+        (state.hasRuntime
+          ? !!state.clientId && !!bundledDev.clients?.get(state.clientId)
+          : true)
+      if (settled && state.clientId === lastClientId) {
+        stableChecks++
+      } else {
+        stableChecks = 0
+      }
+      lastClientId = state?.clientId
+      return stableChecks >= 2
+    },
+    { timeout: 10_000, interval: 100 },
+  )
+}
+
 export async function startDefaultServe(): Promise<void> {
   setupConsoleWarnCollector(serverLogs)
 
@@ -323,28 +376,7 @@ export async function startDefaultServe(): Promise<void> {
             { timeout: 15_000 },
           )
           .catch(() => {})
-        // TODO: workaround — an edit fired while no client is connected is
-        // dropped (vitejs/vite#23028). Remove this wait once the server
-        // buffers updates for clients that connect later. A page that never
-        // loads the client runtime (e.g. SSR-rendered pages) cannot register
-        // a client; a fully loaded page with no runtime counts as settled.
-        await vi.waitUntil(
-          async () => {
-            const state = await page
-              .evaluate(() => ({
-                loaded: document.readyState === 'complete',
-                hasRuntime: !!(globalThis as any).__rolldown_runtime__,
-                clientId: (globalThis as any).__rolldown_runtime__?.clientId,
-              }))
-              .catch(() => undefined)
-            if (!state) return false
-            if (state.clientId && bundledDev.clients?.get(state.clientId)) {
-              return true
-            }
-            return state.loaded && !state.hasRuntime
-          },
-          { timeout: 10_000 },
-        )
+        await waitForBundledDevSettled()
       }
     }
   } else {
